@@ -168,9 +168,10 @@ pkgs.testers.runNixOSTest {
         assert outcome == "switched", outcome
         assert current() == agent_changed, current()
         assert version() == "agent-changed"
-        # The run that started the switch is the one that finished it: no
-        # second invocation, and its own output reports the switch.
-        assert machine.succeed("systemctl show -P InvocationID fleet-pull-agent.service").strip() == invocation
+        # The run that started the switch is the one that finished it: the
+        # invocation captured at start logged the switch result itself. (The
+        # unit's InvocationID property is not compared after the run: systemd
+        # does not keep it stable once the unit is inactive.)
         machine.wait_until_succeeds(
             f"journalctl _SYSTEMD_INVOCATION_ID={invocation} -o cat | grep -F '\"action\": \"switched\"'"
         )

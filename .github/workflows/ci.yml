@@ -1,0 +1,187 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Fleet-wide rollback: republish the hosts of an earlier deploy under a
+  # new, higher seq. Reverting a commit on the deploy branch does not work:
+  # it republishes an older seq, which nodes refuse.
+  workflow_dispatch:
+    inputs:
+      seq:
+        description: "seq of the earlier deploy to restore (see git log deploy)"
+        required: true
+        type: number
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Configure these as repository secrets / variables. Without them (e.g. PRs
+  # from forks) everything still builds, it just does not use or fill the cache.
+  ATTIC_ENDPOINT: ${{ vars.ATTIC_ENDPOINT }}
+  ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
+  ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+
+jobs:
+  # 1. Evaluate. Every host's toplevel store path is fixed here, before
+  #    anything is built: it is a pure function of this commit.
+  eval:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    outputs:
+      hosts: ${{ steps.hosts.outputs.hosts }}
+      toplevels: ${{ steps.hosts.outputs.toplevels }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: flake check (evaluation only, all systems)
+        run: nix flake check --no-build --all-systems
+      - name: Toplevels this commit would deploy
+        id: hosts
+        run: |
+          toplevels=$(nix eval --json .#fleet.toplevels | jq -c .)
+          jq . <<<"$toplevels" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "toplevels=$toplevels" >> "$GITHUB_OUTPUT"
+          echo "hosts=$(nix eval --json .#fleet.hosts | jq -c '
+            to_entries | map({
+              name: .key,
+              system: .value,
+              runner: (if .value == "aarch64-linux" then "ubuntu-24.04-arm" else "ubuntu-24.04" end)
+            })')" >> "$GITHUB_OUTPUT"
+
+  # 2. Build every host natively on its own architecture and push the
+  #    closures to Attic. On PRs, show what changes against production.
+  build:
+    needs: eval
+    strategy:
+      fail-fast: false
+      matrix:
+        host: ${{ fromJSON(needs.eval.outputs.hosts) }}
+    name: build (${{ matrix.host.name }}, ${{ matrix.host.system }})
+    runs-on: ${{ matrix.host.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Use the fleet cache
+        if: env.ATTIC_TOKEN != ''
+        run: |
+          nix profile install --inputs-from . nixpkgs#attic-client
+          attic login fleet "$ATTIC_ENDPOINT" "$ATTIC_TOKEN"
+          attic use "fleet:$ATTIC_CACHE"
+      - name: Build ${{ matrix.host.name }}
+        run: nix build --print-build-logs .#nixosConfigurations.${{ matrix.host.name }}.config.system.build.toplevel
+      - name: Closure diff against what production runs now
+        if: github.event_name == 'pull_request' && env.ATTIC_TOKEN != ''
+        continue-on-error: true
+        env:
+          HOST: ${{ matrix.host.name }}
+        run: |
+          # The tip of the deploy branch can be a failed build (empty hosts).
+          # Production runs the newest manifest with status "ok".
+          git fetch --quiet --depth=50 origin deploy || exit 0
+          deployed=""
+          for commit in $(git rev-list FETCH_HEAD); do
+            manifest=$(git show "$commit:manifest.json")
+            if [ "$(jq -r .status <<<"$manifest")" = ok ]; then
+              deployed=$(jq -r --arg h "$HOST" '.hosts[$h] // empty' <<<"$manifest")
+              break
+            fi
+          done
+          [ -n "$deployed" ] || exit 0
+          nix-store --realise "$deployed" > /dev/null
+          {
+            echo "### $HOST: closure diff vs production"
+            echo '```'
+            nix store diff-closures "$deployed" ./result
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Push closure to Attic
+        if: github.event_name == 'push' && env.ATTIC_TOKEN != ''
+        run: attic push "fleet:$ATTIC_CACHE" ./result
+
+  # 3. Unit tests for the agent and a full deploy/rollback cycle in a VM.
+  test:
+    needs: eval
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - name: Agent unit tests and NixOS VM test
+        run: nix build --print-build-logs .#checks.x86_64-linux.agent .#checks.x86_64-linux.pull-agent-vm
+
+  # 4. Publish the manifest on every push to main, green or not. Only a
+  #    green run publishes hosts, and only once every closure is in the
+  #    cache and every test passed. A red run publishes status "failed" with
+  #    no hosts: nodes ignore it, monitoring sees it. `!cancelled()` rather
+  #    than `always()`, so a superseded or cancelled run publishes nothing.
+  publish:
+    needs: [eval, build, test]
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    concurrency: publish
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write manifest
+        env:
+          GREEN: ${{ needs.eval.result == 'success' && needs.build.result == 'success' && needs.test.result == 'success' }}
+          TOPLEVELS: ${{ needs.eval.outputs.toplevels }}
+        run: |
+          if [ "$GREEN" = true ]; then
+            status=ok enabled=true hosts=$TOPLEVELS
+          else
+            status=failed enabled=false hosts='{}'
+          fi
+          jq -n --argjson seq "${{ github.run_number }}" --arg rev "$GITHUB_SHA" \
+                --arg status "$status" --argjson enabled "$enabled" --argjson hosts "$hosts" \
+                '{seq: $seq, rev: $rev, status: $status, enabled: $enabled, hosts: $hosts}' \
+                > "$RUNNER_TEMP/manifest.json"
+          tee -a "$GITHUB_STEP_SUMMARY" < "$RUNNER_TEMP/manifest.json"
+      - name: Commit to the deploy branch
+        run: bash .github/publish-manifest.sh "$RUNNER_TEMP/manifest.json" "deploy ${GITHUB_SHA::7}"
+
+  # Manual rollback (workflow_dispatch). Same workflow as the deploys, so
+  # github.run_number keeps increasing and the restored manifest gets a seq
+  # higher than anything the nodes have applied.
+  rollback:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    concurrency: publish
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find the deploy to restore
+        env:
+          RESTORE_SEQ: ${{ inputs.seq }}
+        run: |
+          git fetch --quiet origin deploy
+          for commit in $(git rev-list FETCH_HEAD); do
+            if git show "$commit:manifest.json" \
+                | jq -e --argjson s "$RESTORE_SEQ" '.seq == $s and .status == "ok"' > /dev/null; then
+              git show "$commit:manifest.json" \
+                | jq --argjson seq "${{ github.run_number }}" \
+                     '{seq: $seq, rev, status, enabled: true, hosts}' > "$RUNNER_TEMP/manifest.json"
+              tee -a "$GITHUB_STEP_SUMMARY" < "$RUNNER_TEMP/manifest.json"
+              exit 0
+            fi
+          done
+          echo "::error::no deploy with seq $RESTORE_SEQ and status ok on the deploy branch"
+          exit 1
+      - name: Commit to the deploy branch
+        run: bash .github/publish-manifest.sh "$RUNNER_TEMP/manifest.json" "rollback to seq ${{ inputs.seq }}" --resume

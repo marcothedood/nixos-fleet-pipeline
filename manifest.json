@@ -1,7 +1,10 @@
 {
-  "seq": 1,
-  "rev": "e0e323f819ad0495c895a1abf20ddfeb4553d6f5",
-  "status": "failed",
-  "enabled": false,
-  "hosts": {}
+  "seq": 2,
+  "rev": "c6657e0a1384ba5a65b5a651f30abad626e1a1e8",
+  "status": "ok",
+  "enabled": true,
+  "hosts": {
+    "web-arm": "/nix/store/hshagm623mxq0agp3n5vzf4h6rlp562b-nixos-system-web-arm-26.05.20261105.c56a87d",
+    "web-x86": "/nix/store/s7n4kqhaazg265l5zqk5nyjqf4699szj-nixos-system-web-x86-26.05.20261105.c56a87d"
+  }
 }
